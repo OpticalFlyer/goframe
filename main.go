@@ -94,7 +94,7 @@ func loadImage(path string) (*ebiten.Image, error) {
 	dst := image.NewRGBA(image.Rect(0, 0, maxWidth, maxHeight))
 	draw.CatmullRom.Scale(dst, dst.Bounds(), img, img.Bounds(), draw.Over, nil)
 
-	return ebiten.NewImageFromImage(img), nil
+	return ebiten.NewImageFromImage(dst), nil
 }
 
 func main() {
