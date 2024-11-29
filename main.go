@@ -19,7 +19,7 @@ type Game struct {
 }
 
 func (g *Game) Update() error {
-	if time.Since(g.lastUpdate) > 1*time.Second {
+	if time.Since(g.lastUpdate) > 5*time.Second {
 		g.currentIdx = (g.currentIdx + 1) % len(g.images)
 		g.lastUpdate = time.Now()
 	}
