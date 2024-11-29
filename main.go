@@ -20,6 +20,8 @@ type Game struct {
 	lastUpdate time.Time
 	mu         sync.RWMutex
 	paused     bool
+	photoSync  *PhotoSync
+	lastSync   time.Time
 }
 
 func (g *Game) getScreenDimensions() (int, int) {
@@ -47,6 +49,16 @@ func (g *Game) handleInput(x, screenWidth int) {
 }
 
 func (g *Game) Update() error {
+	if time.Since(g.lastSync) > g.photoSync.retryBackoff {
+		g.lastSync = time.Now()
+		go func() {
+			if err := g.photoSync.Sync(); err != nil {
+				fmt.Printf("Sync error (will retry in %v): %v\n",
+					g.photoSync.retryBackoff, err)
+			}
+		}()
+	}
+
 	width, _ := g.getScreenDimensions()
 
 	// Handle touch input using AppendTouchIDs
@@ -204,6 +216,17 @@ func loadImage(path string) (*ebiten.Image, error) {
 	return ebiten.NewImageFromImage(dst), nil
 }
 
+func (g *Game) reloadPhotos() {
+	g.mu.Lock()
+	g.images = make([]*ebiten.Image, 0)
+	g.currentIdx = 0
+	g.mu.Unlock()
+
+	if err := loadImagesFromDir(g.photoSync.photoDir, g); err != nil {
+		fmt.Printf("Failed to reload images: %v\n", err)
+	}
+}
+
 func main() {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
@@ -213,11 +236,36 @@ func main() {
 
 	dir := filepath.Join(homeDir, ".goframe")
 
+	// Get server URL from environment variable or use default
+	serverURL := os.Getenv("GOFRAMESERVER")
+	if serverURL == "" {
+		serverURL = "http://localhost:8080" // Default value
+		fmt.Println("GOFRAMESERVER not set, using default:", serverURL)
+	}
+
+	// Create Game instance first
 	game := &Game{
 		images:     make([]*ebiten.Image, 0),
 		currentIdx: 0,
 		lastUpdate: time.Now(),
 		paused:     false,
+	}
+
+	// Now create PhotoSync with game's reload method
+	photoSync := NewPhotoSync(
+		serverURL,
+		dir,
+		game.reloadPhotos,
+	)
+
+	// Set the photoSync field and lastSync time
+	game.photoSync = photoSync
+	game.lastSync = time.Now().Add(-photoSync.retryBackoff)
+
+	// Create directory if it doesn't exist
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		fmt.Printf("Failed to create directory: %v\n", err)
+		return
 	}
 
 	if err := loadImagesFromDir(dir, game); err != nil {
