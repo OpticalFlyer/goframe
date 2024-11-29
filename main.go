@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"image"
+	"image/color"
 	_ "image/jpeg"
 	"os"
 	"path/filepath"
@@ -11,17 +12,26 @@ import (
 
 	"github.com/hajimehoshi/ebiten/v2"
 	"github.com/hajimehoshi/ebiten/v2/inpututil"
+	"github.com/hajimehoshi/ebiten/v2/vector"
 	"golang.org/x/image/draw"
 )
 
 type Game struct {
-	images     []*ebiten.Image
-	currentIdx int
-	lastUpdate time.Time
-	mu         sync.RWMutex
-	paused     bool
-	photoSync  *PhotoSync
-	lastSync   time.Time
+	images       []*ebiten.Image
+	currentIdx   int
+	lastUpdate   time.Time
+	mu           sync.RWMutex
+	paused       bool
+	photoSync    *PhotoSync
+	lastSync     time.Time
+	overlayStart time.Time
+	showOverlay  bool
+}
+
+var whiteImage = ebiten.NewImage(3, 3)
+
+func init() {
+	whiteImage.Fill(color.White)
 }
 
 func (g *Game) getScreenDimensions() (int, int) {
@@ -36,6 +46,77 @@ func (g *Game) getScreenDimensions() (int, int) {
 	return ebiten.WindowSize()
 }
 
+func (g *Game) drawOverlay(screen *ebiten.Image, width, height int) {
+	if !g.showOverlay {
+		return
+	}
+
+	elapsed := time.Since(g.overlayStart).Seconds()
+	if elapsed > 1.0 {
+		g.showOverlay = false
+		return
+	}
+
+	alpha := float32(1.0 - elapsed)
+	centerX := float32(width / 2)
+	centerY := float32(height / 2)
+
+	var path vector.Path
+
+	if g.paused {
+		// Draw pause bars
+		barWidth := float32(20)
+		barHeight := float32(60)
+		gap := float32(20)
+
+		// Left bar
+		path.MoveTo(centerX-gap-barWidth, centerY-barHeight/2)
+		path.LineTo(centerX-gap, centerY-barHeight/2)
+		path.LineTo(centerX-gap, centerY+barHeight/2)
+		path.LineTo(centerX-gap-barWidth, centerY+barHeight/2)
+		path.Close()
+
+		// Right bar
+		path.MoveTo(centerX+gap, centerY-barHeight/2)
+		path.LineTo(centerX+gap+barWidth, centerY-barHeight/2)
+		path.LineTo(centerX+gap+barWidth, centerY+barHeight/2)
+		path.LineTo(centerX+gap, centerY+barHeight/2)
+		path.Close()
+	} else {
+		// Draw play triangle
+		size := float32(30)
+		path.MoveTo(centerX-size, centerY-size)
+		path.LineTo(centerX-size, centerY+size)
+		path.LineTo(centerX+size, centerY)
+		path.Close()
+	}
+
+	// Get vertices and indices
+	vertices, indices := path.AppendVerticesAndIndicesForFilling(nil, nil)
+
+	// Set colors for all vertices
+	for i := range vertices {
+		vertices[i].SrcX = 1
+		vertices[i].SrcY = 1
+		if g.paused {
+			vertices[i].ColorR = 1
+			vertices[i].ColorG = 0
+			vertices[i].ColorB = 0
+		} else {
+			vertices[i].ColorR = 0
+			vertices[i].ColorG = 1
+			vertices[i].ColorB = 0
+		}
+		vertices[i].ColorA = alpha
+	}
+
+	// Draw the shape
+	op := &ebiten.DrawTrianglesOptions{
+		FillRule: ebiten.FillRuleNonZero,
+	}
+	screen.DrawTriangles(vertices, indices, whiteImage, op)
+}
+
 func (g *Game) handleInput(x, screenWidth int) {
 	third := screenWidth / 3
 
@@ -45,6 +126,8 @@ func (g *Game) handleInput(x, screenWidth int) {
 		g.nextPhoto()
 	} else { // Center third
 		g.paused = !g.paused
+		g.showOverlay = true
+		g.overlayStart = time.Now()
 	}
 }
 
@@ -135,6 +218,10 @@ func (g *Game) Draw(screen *ebiten.Image) {
 	)
 
 	screen.DrawImage(img, op)
+
+	// Draw overlay after image
+	width, height := screen.Bounds().Dx(), screen.Bounds().Dy()
+	g.drawOverlay(screen, width, height)
 }
 
 func (g *Game) Layout(outsideWidth, outsideHeight int) (int, int) {
@@ -277,7 +364,7 @@ func main() {
 	ebiten.SetWindowSize(800, 600)
 	ebiten.SetWindowTitle("Photo Frame")
 	ebiten.SetFullscreen(true)
-	ebiten.SetCursorMode(ebiten.CursorModeHidden)
+	ebiten.SetCursorMode(ebiten.CursorModeVisible)
 
 	if err := ebiten.RunGame(game); err != nil {
 		fmt.Printf("Failed to run game: %v\n", err)
