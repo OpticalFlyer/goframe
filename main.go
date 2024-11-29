@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/hajimehoshi/ebiten/v2"
+	"golang.org/x/image/draw"
 )
 
 type Game struct {
@@ -87,6 +88,11 @@ func loadImage(path string) (*ebiten.Image, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Resize the image to a smaller size
+	const maxWidth, maxHeight = 1920, 1080
+	dst := image.NewRGBA(image.Rect(0, 0, maxWidth, maxHeight))
+	draw.CatmullRom.Scale(dst, dst.Bounds(), img, img.Bounds(), draw.Over, nil)
 
 	return ebiten.NewImageFromImage(img), nil
 }
