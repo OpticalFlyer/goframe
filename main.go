@@ -415,7 +415,7 @@ func main() {
 	// Start directory watcher
 	go watchDirectory(dir, game)
 
-	ebiten.SetWindowResizingMode(ebiten.WindowResizingModeEnabled)
+	//ebiten.SetWindowResizingMode(ebiten.WindowResizingModeEnabled)
 	ebiten.SetWindowSize(800, 600)
 	ebiten.SetWindowTitle("Photo Frame")
 	ebiten.SetFullscreen(true)
