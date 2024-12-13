@@ -1,4 +1,3 @@
-// main.go
 package main
 
 import (
@@ -11,27 +10,22 @@ import (
 	"sync"
 	"time"
 
-	"github.com/fsnotify/fsnotify"
 	"github.com/hajimehoshi/ebiten/v2"
 	"github.com/hajimehoshi/ebiten/v2/inpututil"
 	"github.com/hajimehoshi/ebiten/v2/vector"
 	"golang.org/x/image/draw"
 )
 
-type Photo struct {
-	Path string
-	Img  *ebiten.Image
-}
-
 type Game struct {
-	photos       []Photo
+	images       []*ebiten.Image
 	currentIdx   int
 	lastUpdate   time.Time
 	mu           sync.RWMutex
 	paused       bool
+	photoSync    *PhotoSync
+	lastSync     time.Time
 	overlayStart time.Time
 	showOverlay  bool
-	photoDir     string
 }
 
 var whiteImage = ebiten.NewImage(3, 3)
@@ -138,6 +132,16 @@ func (g *Game) handleInput(x, screenWidth int) {
 }
 
 func (g *Game) Update() error {
+	if time.Since(g.lastSync) > g.photoSync.retryBackoff {
+		g.lastSync = time.Now()
+		go func() {
+			if err := g.photoSync.Sync(); err != nil {
+				fmt.Printf("Sync error (will retry in %v): %v\n",
+					g.photoSync.retryBackoff, err)
+			}
+		}()
+	}
+
 	width, _ := g.getScreenDimensions()
 
 	// Handle touch input using AppendTouchIDs
@@ -171,22 +175,22 @@ func (g *Game) Update() error {
 
 func (g *Game) nextPhoto() {
 	g.mu.RLock()
-	defer g.mu.RUnlock()
-	if len(g.photos) > 0 {
-		g.currentIdx = (g.currentIdx + 1) % len(g.photos)
+	if len(g.images) > 0 {
+		g.currentIdx = (g.currentIdx + 1) % len(g.images)
 	}
+	g.mu.RUnlock()
 	g.lastUpdate = time.Now()
 }
 
 func (g *Game) previousPhoto() {
 	g.mu.RLock()
-	defer g.mu.RUnlock()
-	if len(g.photos) > 0 {
+	if len(g.images) > 0 {
 		g.currentIdx--
 		if g.currentIdx < 0 {
-			g.currentIdx = len(g.photos) - 1
+			g.currentIdx = len(g.images) - 1
 		}
 	}
+	g.mu.RUnlock()
 	g.lastUpdate = time.Now()
 }
 
@@ -194,11 +198,11 @@ func (g *Game) Draw(screen *ebiten.Image) {
 	screen.Clear()
 
 	g.mu.RLock()
-	if len(g.photos) == 0 {
+	if len(g.images) == 0 {
 		g.mu.RUnlock()
 		return
 	}
-	img := g.photos[g.currentIdx].Img
+	img := g.images[g.currentIdx]
 	g.mu.RUnlock()
 
 	imgWidth := img.Bounds().Dx()
@@ -231,43 +235,10 @@ func (g *Game) Layout(outsideWidth, outsideHeight int) (int, int) {
 	return outsideWidth, outsideHeight
 }
 
-func (g *Game) AddImage(path string, img *ebiten.Image) {
+func (g *Game) AddImage(img *ebiten.Image) {
 	g.mu.Lock()
-	defer g.mu.Unlock()
-	// Check if image already exists
-	for _, photo := range g.photos {
-		if photo.Path == path {
-			return // Image already exists
-		}
-	}
-	g.photos = append(g.photos, Photo{Path: path, Img: img})
-	fmt.Printf("Added image: %s\n", path)
-}
-
-func (g *Game) RemoveImageByPath(path string) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	index := -1
-	for i, photo := range g.photos {
-		if photo.Path == path {
-			index = i
-			break
-		}
-	}
-
-	if index == -1 {
-		fmt.Printf("Image not found for removal: %s\n", path)
-		return
-	}
-
-	// Remove the image from the slice
-	g.photos = append(g.photos[:index], g.photos[index+1:]...)
-	fmt.Printf("Removed image: %s\n", path)
-
-	// Adjust currentIdx if necessary
-	if g.currentIdx >= len(g.photos) && len(g.photos) > 0 {
-		g.currentIdx = 0
-	}
+	g.images = append(g.images, img)
+	g.mu.Unlock()
 }
 
 func loadImagesFromDir(dir string, game *Game) error {
@@ -276,13 +247,16 @@ func loadImagesFromDir(dir string, game *Game) error {
 		return err
 	}
 
-	semaphore := make(chan struct{}, 4)
+	var wg sync.WaitGroup
+	semaphore := make(chan struct{}, 4) // Limit concurrent goroutines
 
 	for _, file := range files {
-		if filepath.Ext(file.Name()) == ".jpeg" || filepath.Ext(file.Name()) == ".jpg" {
-			semaphore <- struct{}{}
+		if filepath.Ext(file.Name()) == ".jpeg" {
+			wg.Add(1)
 			go func(filename string) {
-				defer func() { <-semaphore }()
+				defer wg.Done()
+				semaphore <- struct{}{}        // Acquire
+				defer func() { <-semaphore }() // Release
 
 				path := filepath.Join(dir, filename)
 				img, err := loadImage(path)
@@ -290,12 +264,17 @@ func loadImagesFromDir(dir string, game *Game) error {
 					fmt.Printf("Failed to load image %s: %v\n", path, err)
 					return
 				}
-				game.AddImage(path, img)
+				game.AddImage(img)
 			}(file.Name())
 		}
 	}
 
-	fmt.Println("Started loading images asynchronously")
+	// Start a goroutine to wait for all images to finish loading
+	go func() {
+		wg.Wait()
+		fmt.Println("All images loaded")
+	}()
+
 	return nil
 }
 
@@ -331,54 +310,14 @@ func loadImage(path string) (*ebiten.Image, error) {
 	return ebiten.NewImageFromImage(dst), nil
 }
 
-func watchDirectory(dir string, game *Game) {
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		fmt.Printf("Failed to create watcher: %v\n", err)
-		return
-	}
-	defer watcher.Close()
+func (g *Game) reloadPhotos() {
+	g.mu.Lock()
+	g.images = make([]*ebiten.Image, 0)
+	g.currentIdx = 0
+	g.mu.Unlock()
 
-	err = watcher.Add(dir)
-	if err != nil {
-		fmt.Printf("Failed to add directory to watcher: %v\n", err)
-		return
-	}
-
-	fmt.Printf("Started watching directory: %s\n", dir)
-
-	for {
-		select {
-		case event, ok := <-watcher.Events:
-			if !ok {
-				return
-			}
-			// Handle different event types
-			switch {
-			case event.Op&fsnotify.Create == fsnotify.Create:
-				if filepath.Ext(event.Name) == ".jpeg" || filepath.Ext(event.Name) == ".jpg" {
-					fmt.Printf("Detected new image: %s\n", event.Name)
-					go func(path string) {
-						img, err := loadImage(path)
-						if err != nil {
-							fmt.Printf("Failed to load new image %s: %v\n", path, err)
-							return
-						}
-						game.AddImage(path, img)
-					}(event.Name)
-				}
-			case event.Op&fsnotify.Remove == fsnotify.Remove, event.Op&fsnotify.Rename == fsnotify.Rename:
-				if filepath.Ext(event.Name) == ".jpeg" || filepath.Ext(event.Name) == ".jpg" {
-					fmt.Printf("Detected removed image: %s\n", event.Name)
-					game.RemoveImageByPath(event.Name)
-				}
-			}
-		case err, ok := <-watcher.Errors:
-			if !ok {
-				return
-			}
-			fmt.Printf("Watcher error: %v\n", err)
-		}
+	if err := loadImagesFromDir(g.photoSync.photoDir, g); err != nil {
+		fmt.Printf("Failed to reload images: %v\n", err)
 	}
 }
 
@@ -391,14 +330,31 @@ func main() {
 
 	dir := filepath.Join(homeDir, ".goframe")
 
-	// Create Game instance
+	// Get server URL from environment variable or use default
+	serverURL := os.Getenv("GOFRAMESERVER")
+	if serverURL == "" {
+		serverURL = "http://localhost:8080" // Default value
+		fmt.Println("GOFRAMESERVER not set, using default:", serverURL)
+	}
+
+	// Create Game instance first
 	game := &Game{
-		photos:     make([]Photo, 0),
+		images:     make([]*ebiten.Image, 0),
 		currentIdx: 0,
 		lastUpdate: time.Now(),
 		paused:     false,
-		photoDir:   dir,
 	}
+
+	// Now create PhotoSync with game's reload method
+	photoSync := NewPhotoSync(
+		serverURL,
+		dir,
+		game.reloadPhotos,
+	)
+
+	// Set the photoSync field and lastSync time
+	game.photoSync = photoSync
+	game.lastSync = time.Now().Add(-photoSync.retryBackoff)
 
 	// Create directory if it doesn't exist
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -406,16 +362,12 @@ func main() {
 		return
 	}
 
-	// Start loading images asynchronously
 	if err := loadImagesFromDir(dir, game); err != nil {
 		fmt.Printf("Failed to start loading images: %v\n", err)
 		return
 	}
 
-	// Start directory watcher
-	go watchDirectory(dir, game)
-
-	//ebiten.SetWindowResizingMode(ebiten.WindowResizingModeEnabled)
+	ebiten.SetWindowResizingMode(ebiten.WindowResizingModeEnabled)
 	ebiten.SetWindowSize(800, 600)
 	ebiten.SetWindowTitle("Photo Frame")
 	ebiten.SetFullscreen(true)
