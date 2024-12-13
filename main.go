@@ -418,7 +418,7 @@ func main() {
 	ebiten.SetWindowResizingMode(ebiten.WindowResizingModeEnabled)
 	ebiten.SetWindowSize(800, 600)
 	ebiten.SetWindowTitle("Photo Frame")
-	// ebiten.SetFullscreen(true)
+	ebiten.SetFullscreen(true)
 
 	if err := ebiten.RunGame(game); err != nil {
 		fmt.Printf("Failed to run game: %v\n", err)
